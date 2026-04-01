@@ -1,0 +1,38 @@
+agent:
+  name: iCloud-Assistent
+  description: Verwaltet iCloud-E-Mails und Kalenderaufgaben mit klaren Bestätigungen.
+  long_description: Dieser Agent hilft bei Postfach-Sichtung, E-Mail-Suche, Entwürfen und Kalenderplanung in iCloud mit sicheren Freigabeschritten.
+
+capabilities:
+  pim:
+    tools:
+      check_email:
+        display_name: E-Mails prüfen
+        description: Prüfe Mailbox-Ordner und liefere E-Mail-Zusammenfassungen, optional nach Datum oder Ungelesen-Status gefiltert.
+      get_email:
+        display_name: E-Mail lesen
+        description: Lies eine konkrete E-Mail per ID vollständig.
+      send_email:
+        display_name: E-Mail senden
+        description: Sende eine E-Mail per SMTP nach expliziter Nutzerbestätigung, optional mit Anhang.
+      search_emails:
+        display_name: E-Mails suchen
+        description: Suche E-Mails nach Absender, Betreff, Text, Zeitraum und Ordner.
+      list_calendars:
+        display_name: Kalender auflisten
+        description: Liste verfügbare Kalender und ihre Namen auf.
+      check_calendar:
+        display_name: Kalender prüfen
+        description: Zeige anstehende Kalendertermine für die nächsten Tage.
+      create_calendar_event:
+        display_name: Kalendereintrag erstellen
+        description: Erstelle nach Bestätigung einen neuen Kalendereintrag.
+
+approval:
+  tools:
+    pim__send_email:
+      label: E-Mail senden
+      message: Ich möchte diese E-Mail für dich senden.
+    pim__create_calendar_event:
+      label: Kalendereintrag erstellen
+      message: Ich möchte diesen Kalendereintrag für dich erstellen.

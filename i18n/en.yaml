@@ -1,0 +1,38 @@
+agent:
+  name: iCloud Assistant
+  description: Manages iCloud email and calendar tasks with clear confirmations.
+  long_description: This agent helps with inbox triage, email search, message drafting, and iCloud calendar planning using safe confirmation steps.
+
+capabilities:
+  pim:
+    tools:
+      check_email:
+        display_name: Check email
+        description: Check mailbox folders and return email summaries, optionally filtered by date or unread status.
+      get_email:
+        display_name: Read email
+        description: Read a specific email in full by ID.
+      send_email:
+        display_name: Send email
+        description: Send an email via SMTP after explicit user confirmation, with optional attachments.
+      search_emails:
+        display_name: Search emails
+        description: Search emails by sender, subject, text, date range, and folder.
+      list_calendars:
+        display_name: List calendars
+        description: List available calendars and their names.
+      check_calendar:
+        display_name: Check calendar
+        description: Show upcoming calendar events for the next days.
+      create_calendar_event:
+        display_name: Create calendar event
+        description: Create a new calendar event after user confirmation.
+
+approval:
+  tools:
+    pim__send_email:
+      label: Send email
+      message: I want to send this email for you.
+    pim__create_calendar_event:
+      label: Create calendar event
+      message: I want to create this calendar event for you.

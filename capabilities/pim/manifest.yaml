@@ -1,0 +1,218 @@
+id: pim
+class: tool
+image: selu-cap-pim-icloud:latest
+
+tools:
+  - name: check_email
+    description: >
+      Check for emails in a mailbox folder. Returns a list of email summaries
+      including sender, subject, date, and a short preview. Use the since_date
+      parameter to only fetch emails newer than a specific time.
+    input_schema:
+      type: object
+      properties:
+        folder:
+          type: string
+          description: "Mailbox folder to check (default: INBOX)"
+        limit:
+          type: integer
+          description: "Maximum number of emails to return (default: 20)"
+        since_date:
+          type: string
+          description: "Only return emails after this ISO 8601 date/time (e.g. 2026-03-01T00:00:00Z)"
+        unseen_only:
+          type: boolean
+          description: "If true, only return unread emails (default: false)"
+      required: []
+    recommended_policy: allow
+
+  - name: get_email
+    description: >
+      Read the full content of a specific email by its ID. Returns the complete
+      email including sender, recipients, subject, date, body text, and attachment
+      filenames.
+    input_schema:
+      type: object
+      properties:
+        email_id:
+          type: string
+          description: "The email ID (from check_email or search_emails results)"
+      required:
+        - email_id
+    recommended_policy: allow
+
+  - name: send_email
+    description: >
+      Send an email via SMTP. Always confirm with the user before calling this
+      tool — sending email is irreversible. Supports optional file attachments.
+    input_schema:
+      type: object
+      properties:
+        to:
+          type: string
+          description: "Recipient email address (or comma-separated list for multiple)"
+        subject:
+          type: string
+          description: "Email subject line"
+        body:
+          type: string
+          description: "Email body (plain text)"
+        cc:
+          type: string
+          description: "CC recipients (comma-separated, optional)"
+        reply_to_email_id:
+          type: string
+          description: "If replying, the ID of the email being replied to (sets In-Reply-To header)"
+        attachments:
+          type: array
+          description: "Optional file attachments"
+          items:
+            type: object
+            properties:
+              filename:
+                type: string
+                description: "Attachment filename (e.g. report.pdf)"
+              mime_type:
+                type: string
+                description: "Attachment MIME type (e.g. application/pdf)"
+              artifact_id:
+                type: string
+                description: "Optional artifact reference ID (resolved by orchestrator when available)"
+            required: []
+      required:
+        - to
+        - subject
+        - body
+    recommended_policy: ask
+
+  - name: search_emails
+    description: >
+      Search emails using various criteria. Combines filters with AND logic.
+      Returns matching email summaries.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: "General search text (searches subject and body)"
+        from_addr:
+          type: string
+          description: "Filter by sender email address or name"
+        subject:
+          type: string
+          description: "Filter by subject line content"
+        since_date:
+          type: string
+          description: "Only emails after this date (ISO 8601)"
+        before_date:
+          type: string
+          description: "Only emails before this date (ISO 8601)"
+        folder:
+          type: string
+          description: "Mailbox folder to search (default: INBOX)"
+        limit:
+          type: integer
+          description: "Maximum results (default: 20)"
+      required: []
+    recommended_policy: allow
+
+  - name: list_calendars
+    description: >
+      List all available calendars. Returns each calendar's name and URL.
+      Call this before create_calendar_event to discover which calendars
+      exist and pick the right one.
+    input_schema:
+      type: object
+      properties: {}
+      required: []
+    recommended_policy: allow
+
+  - name: check_calendar
+    description: >
+      Get upcoming calendar events. Returns events sorted by start time
+      including title, time, location, and description.
+    input_schema:
+      type: object
+      properties:
+        days_ahead:
+          type: integer
+          description: "How many days ahead to look (default: 7)"
+        calendar_name:
+          type: string
+          description: "Specific calendar name to check (default: all calendars)"
+      required: []
+    recommended_policy: allow
+
+  - name: create_calendar_event
+    description: >
+      Create a new calendar event. Always confirm the details with the user
+      before creating — calendar events are visible to others if the calendar
+      is shared.
+    input_schema:
+      type: object
+      properties:
+        summary:
+          type: string
+          description: "Event title/summary"
+        start:
+          type: string
+          description: "Start date/time in ISO 8601 format (e.g. 2026-03-15T14:00:00)"
+        end:
+          type: string
+          description: "End date/time in ISO 8601 format (e.g. 2026-03-15T15:00:00). For all-day events, this is an inclusive end date."
+        location:
+          type: string
+          description: "Event location (optional)"
+        description:
+          type: string
+          description: "Event description/notes (optional)"
+        calendar_name:
+          type: string
+          description: "Which calendar to add the event to (use list_calendars to discover available names)"
+        all_day:
+          type: boolean
+          description: "If true, create an all-day event (ignore time portion; start/end are interpreted as dates and end is inclusive)"
+      required:
+        - summary
+        - start
+        - end
+        - calendar_name
+    recommended_policy: ask
+
+network:
+  mode: allowlist
+  hosts:
+    - "imap.mail.me.com:993"
+    - "smtp.mail.me.com:587"
+    - "caldav.icloud.com:443"
+    - "*.icloud.com:443"
+
+filesystem: temp
+
+credentials:
+  - name: EMAIL_ADDRESS
+    scope: user
+    required: true
+    description: "Your iCloud email address (Apple ID)"
+  - name: APP_PASSWORD
+    scope: user
+    required: true
+    description: "App-specific password (generate at appleid.apple.com > Sign-In and Security > App-Specific Passwords)"
+  - name: IMAP_SERVER
+    scope: system
+    required: false
+    description: "IMAP server address (default: imap.mail.me.com)"
+  - name: SMTP_SERVER
+    scope: system
+    required: false
+    description: "SMTP server address (default: smtp.mail.me.com)"
+  - name: CALDAV_URL
+    scope: system
+    required: false
+    description: "CalDAV server URL (default: https://caldav.icloud.com)"
+
+resources:
+  max_memory_mb: 256
+  max_cpu_fraction: 0.5
+  max_cpu_seconds: 60
+  pids_limit: 64
