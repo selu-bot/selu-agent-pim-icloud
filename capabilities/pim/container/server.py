@@ -299,6 +299,8 @@ def handle_check_email(args: dict, imap: ImapManager) -> str:
             status, data = conn.search(None, search_str)
             if status != "OK":
                 return json.dumps({"error": "Search failed"})
+            if data[0] is None:
+                raise imaplib.IMAP4.abort("search returned None data")
 
             msg_ids = data[0].split()
             if not msg_ids:
@@ -598,6 +600,8 @@ def handle_search_emails(args: dict, imap: ImapManager) -> str:
             status, data = conn.search(None, search_str)
             if status != "OK":
                 return json.dumps({"error": "Search failed"})
+            if data[0] is None:
+                raise imaplib.IMAP4.abort("search returned None data")
 
             msg_ids = data[0].split()
             if not msg_ids:
