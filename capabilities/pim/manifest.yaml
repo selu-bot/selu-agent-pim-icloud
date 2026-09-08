@@ -60,9 +60,12 @@ tools:
         cc:
           type: string
           description: "CC recipients (comma-separated, optional)"
+        reply_to_message_id:
+          type: string
+          description: "RFC Message-ID returned by get_email when replying (sets In-Reply-To and References)"
         reply_to_email_id:
           type: string
-          description: "If replying, the ID of the email being replied to (sets In-Reply-To header)"
+          description: "Deprecated alias for reply_to_message_id"
         attachments:
           type: array
           description: "Optional file attachments"
@@ -75,9 +78,12 @@ tools:
               mime_type:
                 type: string
                 description: "Attachment MIME type (e.g. application/pdf)"
+              capability_artifact_id:
+                type: string
+                description: "Capability artifact ID returned after preparing an attachment"
               artifact_id:
                 type: string
-                description: "Optional artifact reference ID (resolved by orchestrator when available)"
+                description: "Deprecated alias for capability_artifact_id"
             required: []
       required:
         - to
