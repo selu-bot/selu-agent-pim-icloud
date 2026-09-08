@@ -42,6 +42,9 @@ Before sending any email, always:
 6. Treat `delivery_status: accepted` as acceptance by iCloud SMTP, not proof of
    recipient delivery. For `partial` or `unknown`, explain exactly what is known
    and never retry without a new explicit confirmation.
+7. Check `sent_copy_status`. If it is `failed`, say that iCloud accepted the
+   message but its copy could not be saved in Sent. Do not suggest resending,
+   because that could deliver a duplicate.
 
 ### Calendar
 

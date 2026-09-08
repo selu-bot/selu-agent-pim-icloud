@@ -49,6 +49,36 @@ class FakeSmtp:
         return None
 
 
+class FakeImapConnection:
+    def __init__(self):
+        self.list_status = "OK"
+        self.list_data = [b'(\\HasNoChildren \\Sent) "/" "Sent Messages"']
+        self.append_status_by_mailbox = {}
+        self.append_calls = []
+
+    def list(self):
+        return self.list_status, self.list_data
+
+    def append(self, mailbox, flags, internal_date, raw_message):
+        self.append_calls.append(
+            {
+                "mailbox": mailbox,
+                "flags": flags,
+                "internal_date": internal_date,
+                "raw_message": raw_message,
+            }
+        )
+        return self.append_status_by_mailbox.get(mailbox, "OK"), [b"1"]
+
+
+class FakeImapManager:
+    def __init__(self):
+        self.connection = FakeImapConnection()
+
+    def run(self, _operation_name, fn):
+        return fn(self.connection)
+
+
 class SendEmailTests(unittest.TestCase):
     def setUp(self):
         FakeSmtp.refused = {}
@@ -68,6 +98,7 @@ class SendEmailTests(unittest.TestCase):
         self.artifacts = {}
         self.lock = threading.Lock()
         self.tls_context = object()
+        self.imap = FakeImapManager()
         self.smtp_patch = mock.patch.object(server.smtplib, "SMTP", FakeSmtp)
         self.tls_patch = mock.patch.object(
             server.ssl, "create_default_context", return_value=self.tls_context
@@ -86,6 +117,7 @@ class SendEmailTests(unittest.TestCase):
                 self.config,
                 self.artifacts,
                 self.lock,
+                self.imap,
             )
         )
 
@@ -106,6 +138,18 @@ class SendEmailTests(unittest.TestCase):
         self.assertEqual(FakeSmtp.last.message["Message-ID"], result["message_id"])
         self.assertTrue(FakeSmtp.last.message["Date"])
 
+        self.assertEqual(result["sent_copy_status"], "saved")
+        self.assertEqual(result["sent_mailbox"], "Sent Messages")
+        self.assertEqual(len(self.imap.connection.append_calls), 1)
+        append_call = self.imap.connection.append_calls[0]
+        self.assertEqual(append_call["mailbox"], '"Sent Messages"')
+        self.assertEqual(append_call["flags"], r"(\Seen)")
+        self.assertIn(result["message_id"].encode(), append_call["raw_message"])
+        self.assertIn(b"Subject: Status", append_call["raw_message"])
+        saved_message = server.email.message_from_bytes(append_call["raw_message"])
+        saved_text, _ = server.get_email_body(saved_message)
+        self.assertEqual(saved_text, "Hello")
+
     def test_partial_refusal_is_not_reported_as_success(self):
         FakeSmtp.refused = {"john@example.com": (550, b"rejected")}
 
@@ -116,6 +160,8 @@ class SendEmailTests(unittest.TestCase):
         self.assertEqual(result["accepted_recipients"], ["jane@example.com"])
         self.assertEqual(result["refused_recipients"], ["john@example.com"])
         self.assertFalse(result["retry_safe"])
+        self.assertEqual(result["sent_copy_status"], "saved")
+        self.assertEqual(len(self.imap.connection.append_calls), 1)
 
     def test_unknown_delivery_is_not_safe_to_retry_and_consumes_attachment(self):
         self.artifacts["artifact-1"] = {
@@ -132,6 +178,8 @@ class SendEmailTests(unittest.TestCase):
         self.assertEqual(result["delivery_status"], "unknown")
         self.assertFalse(result["retry_safe"])
         self.assertNotIn("artifact-1", self.artifacts)
+        self.assertEqual(result["sent_copy_status"], "not_attempted")
+        self.assertEqual(self.imap.connection.append_calls, [])
 
     def test_definite_auth_failure_preserves_attachment(self):
         self.artifacts["artifact-1"] = {
@@ -148,6 +196,7 @@ class SendEmailTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "authentication_failed")
         self.assertIn("artifact-1", self.artifacts)
+        self.assertEqual(self.imap.connection.append_calls, [])
 
     def test_all_recipients_refused_is_a_definite_failure(self):
         FakeSmtp.send_exception = server.smtplib.SMTPRecipientsRefused(
@@ -174,6 +223,36 @@ class SendEmailTests(unittest.TestCase):
             self.send(args)
 
         self.assertEqual(raised.exception.code, "invalid_reply_message_id")
+
+    def test_sent_mailbox_falls_back_when_server_has_no_special_use_flag(self):
+        self.imap.connection.list_data = [b'(\\HasNoChildren) "/" "Archive"']
+
+        result = self.send()
+
+        self.assertEqual(result["sent_copy_status"], "saved")
+        self.assertEqual(result["sent_mailbox"], "Sent Messages")
+        self.assertEqual(
+            self.imap.connection.append_calls[0]["mailbox"],
+            '"Sent Messages"',
+        )
+
+    def test_sent_copy_failure_does_not_turn_smtp_acceptance_into_retry(self):
+        self.imap.connection.append_status_by_mailbox = {
+            '"Sent Messages"': "NO",
+            '"Sent"': "NO",
+        }
+
+        result = self.send()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["delivery_status"], "accepted")
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(result["sent_copy_status"], "failed")
+        self.assertNotIn("sent_mailbox", result)
+        self.assertEqual(
+            [call["mailbox"] for call in self.imap.connection.append_calls],
+            ['"Sent Messages"', '"Sent"'],
+        )
 
 
 class InvokeContractTests(unittest.TestCase):

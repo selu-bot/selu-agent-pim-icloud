@@ -12,6 +12,7 @@ import email.header
 import email.mime.application
 import email.mime.multipart
 import email.mime.text
+import email.policy
 import email.utils
 import imaplib
 import json
@@ -57,6 +58,7 @@ DEFAULT_CALDAV_URL = "https://caldav.icloud.com"
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 NETWORK_TIMEOUT_SECONDS = 15
 MESSAGE_ID_PATTERN = re.compile(r"^<[^<>\s@]+@[^<>\s@]+>$")
+SENT_MAILBOX_FALLBACKS = ("Sent Messages", "Sent")
 
 
 class ToolFailure(Exception):
@@ -212,6 +214,77 @@ def parse_date(date_str: str) -> Optional[datetime]:
 def imap_date_str(dt: datetime) -> str:
     """Format a datetime for IMAP SINCE/BEFORE criteria."""
     return dt.strftime("%d-%b-%Y")
+
+
+def parse_sent_mailbox(list_response: bytes | str) -> Optional[str]:
+    """Extract a mailbox carrying the IMAP special-use ``\\Sent`` flag."""
+    if isinstance(list_response, bytes):
+        response = list_response.decode("utf-8", errors="replace")
+    else:
+        response = list_response
+
+    if not re.search(r"(?:^|[ (])\\Sent(?:[ )]|$)", response, re.IGNORECASE):
+        return None
+
+    mailbox_match = re.search(
+        r'(?P<mailbox>"(?:\\.|[^"\\])*"|[^\s]+)\s*$',
+        response,
+    )
+    if mailbox_match is None:
+        return None
+
+    mailbox = mailbox_match.group("mailbox")
+    if mailbox.startswith('"') and mailbox.endswith('"'):
+        mailbox = re.sub(r"\\(.)", r"\1", mailbox[1:-1])
+    return mailbox
+
+
+def quote_imap_mailbox(mailbox: str) -> str:
+    """Quote and escape a mailbox for imaplib's raw command serializer."""
+    escaped = mailbox.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def save_sent_copy(
+    imap: ImapManager,
+    raw_message: bytes,
+    sent_at: datetime,
+) -> str:
+    """Append an accepted SMTP message to the account's Sent mailbox."""
+
+    def _run(conn: imaplib.IMAP4_SSL) -> str:
+        candidates: list[str] = []
+        status, mailboxes = conn.list()
+        if status == "OK":
+            for response in mailboxes or []:
+                if response is None:
+                    continue
+                mailbox = parse_sent_mailbox(response)
+                if mailbox and mailbox not in candidates:
+                    candidates.append(mailbox)
+
+        for fallback in SENT_MAILBOX_FALLBACKS:
+            if fallback not in candidates:
+                candidates.append(fallback)
+
+        internal_date = imaplib.Time2Internaldate(sent_at)
+        for mailbox in candidates:
+            try:
+                append_status, _ = conn.append(
+                    quote_imap_mailbox(mailbox),
+                    r"(\Seen)",
+                    internal_date,
+                    raw_message,
+                )
+            except imaplib.IMAP4.error:
+                append_status = "NO"
+            if append_status == "OK":
+                return mailbox
+            log.warning("send_email: Sent append rejected mailbox=%s", mailbox)
+
+        raise RuntimeError("No writable Sent mailbox was found")
+
+    return imap.run("save_sent_copy", _run)
 
 
 def get_email_body(msg: email.message.Message) -> tuple[str, str]:
@@ -484,6 +557,7 @@ def handle_send_email(
     config: dict,
     input_artifacts: dict[str, dict],
     artifact_lock: threading.Lock,
+    imap: ImapManager,
 ) -> str:
     """Submit an email to SMTP without claiming downstream delivery."""
     to_addr = args.get("to")
@@ -573,7 +647,8 @@ def handle_send_email(
     msg["From"] = email_addr
     msg["To"] = to_addr
     msg["Subject"] = subject
-    msg["Date"] = email.utils.format_datetime(datetime.now(timezone.utc))
+    sent_at = datetime.now(timezone.utc)
+    msg["Date"] = email.utils.format_datetime(sent_at)
     sender_domain = email_addr.rpartition("@")[2] or None
     message_id = email.utils.make_msgid(domain=sender_domain)
     msg["Message-ID"] = message_id
@@ -689,6 +764,22 @@ def handle_send_email(
 
     if result is None:
         raise ToolFailure("smtp_failed", "iCloud did not accept the message.")
+
+    result["sent_copy_status"] = "not_attempted"
+    if result["delivery_status"] in {"accepted", "partial"}:
+        try:
+            sent_mailbox = save_sent_copy(
+                imap,
+                msg.as_bytes(policy=email.policy.SMTP),
+                sent_at,
+            )
+            result["sent_copy_status"] = "saved"
+            result["sent_mailbox"] = sent_mailbox
+            log.info("send_email: saved Sent copy mailbox=%s", sent_mailbox)
+        except Exception as exc:
+            result["sent_copy_status"] = "failed"
+            log.warning("send_email: SMTP accepted but Sent copy failed: %s", exc)
+
     consume_artifacts()
     log.info(
         "send_email: completed status=%s accepted=%d refused=%d",
@@ -1108,7 +1199,7 @@ class PimCapabilityServicer(capability_pb2_grpc.CapabilityServicer):
                 )
 
             imap: Optional[ImapManager] = None
-            if tool_name in {"check_email", "get_email", "search_emails"}:
+            if tool_name in {"check_email", "get_email", "send_email", "search_emails"}:
                 imap = ImapManager()
                 imap_server = config.get("IMAP_SERVER", DEFAULT_IMAP_SERVER)
                 imap_port = int(config.get("IMAP_PORT", str(DEFAULT_IMAP_PORT)))
@@ -1125,6 +1216,7 @@ class PimCapabilityServicer(capability_pb2_grpc.CapabilityServicer):
                         config,
                         self._input_artifacts,
                         self._artifact_lock,
+                        imap,
                     )
                 elif tool_name == "search_emails":
                     result = handle_search_emails(args, imap)

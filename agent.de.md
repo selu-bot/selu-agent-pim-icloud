@@ -42,6 +42,9 @@ Bevor du E-Mails sendest:
 6. `delivery_status: accepted` bedeutet nur, dass iCloud SMTP die Nachricht
    angenommen hat, nicht dass sie zugestellt wurde. Bei `partial` oder `unknown`
    genau erklaeren, was bekannt ist, und nie ohne neue explizite Freigabe erneut senden.
+7. Pruefe `sent_copy_status`. Bei `failed` erklaere, dass iCloud die Nachricht
+   angenommen hat, die Kopie aber nicht unter „Gesendet“ gespeichert werden
+   konnte. Schlage kein erneutes Senden vor, weil dadurch ein Duplikat entstehen kann.
 
 ### Kalender
 
