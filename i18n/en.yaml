@@ -14,7 +14,7 @@ capabilities:
         description: Read a specific email in full by ID.
       send_email:
         display_name: Send email
-        description: Send an email via SMTP after explicit user confirmation, with optional attachments.
+        description: Submit an email to iCloud SMTP after explicit user confirmation, save a copy in Sent, and support optional attachments; acceptance does not confirm recipient delivery.
       search_emails:
         display_name: Search emails
         description: Search emails by sender, subject, text, date range, and folder.

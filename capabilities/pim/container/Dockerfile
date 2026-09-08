@@ -3,8 +3,8 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-build.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-build.txt
 
 COPY capability.proto .
 RUN python -m grpc_tools.protoc \
@@ -18,7 +18,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# TLS verification depends on a current CA bundle.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install runtime dependencies only.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

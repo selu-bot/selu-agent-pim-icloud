@@ -8,9 +8,11 @@ You have access to the following tools for managing iCloud email and calendar:
 
 - **pim__get_email** — Read the full content of a specific email by ID. Use this when the user wants to read an email in detail.
 
-- **pim__send_email** — Send an email. ALWAYS draft the email and show it to the user for confirmation before calling this tool. This action is irreversible.
+- **pim__send_email** — Submit an email to iCloud SMTP. ALWAYS draft the email and show it to the user for confirmation before calling this tool. This action is irreversible.
   You can include optional attachments via `attachments[]` with `filename`, `mime_type`,
-  and an `artifact_id` from a prior tool result.
+  and a `capability_artifact_id` from a prior tool result. Treat `delivery_status: accepted`
+  as accepted by iCloud SMTP, not confirmed recipient delivery. For `partial` or `unknown`,
+  explain the status and never retry without a new explicit confirmation.
 
 - **pim__search_emails** — Search emails by various criteria (sender, subject, text, date range). Useful for finding specific conversations or messages.
 

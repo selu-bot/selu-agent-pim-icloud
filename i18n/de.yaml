@@ -14,7 +14,7 @@ capabilities:
         description: Lies eine konkrete E-Mail per ID vollständig.
       send_email:
         display_name: E-Mail senden
-        description: Sende eine E-Mail per SMTP nach expliziter Nutzerbestätigung, optional mit Anhang.
+        description: Übergib eine E-Mail nach expliziter Nutzerbestätigung an iCloud SMTP, speichere eine Kopie unter „Gesendet“ und unterstütze optionale Anhänge; die Annahme bestätigt keine Zustellung.
       search_emails:
         display_name: E-Mails suchen
         description: Suche E-Mails nach Absender, Betreff, Text, Zeitraum und Ordner.

@@ -12,13 +12,16 @@ import email.header
 import email.mime.application
 import email.mime.multipart
 import email.mime.text
+import email.policy
 import email.utils
 import imaplib
 import json
 import logging
 import os
+import re
 import signal
 import smtplib
+import ssl
 import sys
 import threading
 import traceback
@@ -37,10 +40,12 @@ import icalendar
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
     stream=sys.stdout,
 )
+logging.getLogger("caldav").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 log = logging.getLogger("pim")
 
 # ── Default iCloud server configuration ──────────────────────────────────────
@@ -51,6 +56,21 @@ DEFAULT_SMTP_SERVER = "smtp.mail.me.com"
 DEFAULT_SMTP_PORT = 587
 DEFAULT_CALDAV_URL = "https://caldav.icloud.com"
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+NETWORK_TIMEOUT_SECONDS = 15
+MESSAGE_ID_PATTERN = re.compile(r"^<[^<>\s@]+@[^<>\s@]+>$")
+SENT_MAILBOX_FALLBACKS = ("Sent Messages", "Sent")
+
+
+class ToolFailure(Exception):
+    """A safe, stable capability failure for InvokeResponse.error."""
+
+    def __init__(self, code: str, public_message: str) -> None:
+        super().__init__(public_message)
+        self.code = code
+        self.public_message = public_message
+
+    def response_message(self) -> str:
+        return f"{self.code}: {self.public_message}"
 
 # ── IMAP connection manager ──────────────────────────────────────────────────
 
@@ -194,6 +214,77 @@ def parse_date(date_str: str) -> Optional[datetime]:
 def imap_date_str(dt: datetime) -> str:
     """Format a datetime for IMAP SINCE/BEFORE criteria."""
     return dt.strftime("%d-%b-%Y")
+
+
+def parse_sent_mailbox(list_response: bytes | str) -> Optional[str]:
+    """Extract a mailbox carrying the IMAP special-use ``\\Sent`` flag."""
+    if isinstance(list_response, bytes):
+        response = list_response.decode("utf-8", errors="replace")
+    else:
+        response = list_response
+
+    if not re.search(r"(?:^|[ (])\\Sent(?:[ )]|$)", response, re.IGNORECASE):
+        return None
+
+    mailbox_match = re.search(
+        r'(?P<mailbox>"(?:\\.|[^"\\])*"|[^\s]+)\s*$',
+        response,
+    )
+    if mailbox_match is None:
+        return None
+
+    mailbox = mailbox_match.group("mailbox")
+    if mailbox.startswith('"') and mailbox.endswith('"'):
+        mailbox = re.sub(r"\\(.)", r"\1", mailbox[1:-1])
+    return mailbox
+
+
+def quote_imap_mailbox(mailbox: str) -> str:
+    """Quote and escape a mailbox for imaplib's raw command serializer."""
+    escaped = mailbox.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def save_sent_copy(
+    imap: ImapManager,
+    raw_message: bytes,
+    sent_at: datetime,
+) -> str:
+    """Append an accepted SMTP message to the account's Sent mailbox."""
+
+    def _run(conn: imaplib.IMAP4_SSL) -> str:
+        candidates: list[str] = []
+        status, mailboxes = conn.list()
+        if status == "OK":
+            for response in mailboxes or []:
+                if response is None:
+                    continue
+                mailbox = parse_sent_mailbox(response)
+                if mailbox and mailbox not in candidates:
+                    candidates.append(mailbox)
+
+        for fallback in SENT_MAILBOX_FALLBACKS:
+            if fallback not in candidates:
+                candidates.append(fallback)
+
+        internal_date = imaplib.Time2Internaldate(sent_at)
+        for mailbox in candidates:
+            try:
+                append_status, _ = conn.append(
+                    quote_imap_mailbox(mailbox),
+                    r"(\Seen)",
+                    internal_date,
+                    raw_message,
+                )
+            except imaplib.IMAP4.error:
+                append_status = "NO"
+            if append_status == "OK":
+                return mailbox
+            log.warning("send_email: Sent append rejected mailbox=%s", mailbox)
+
+        raise RuntimeError("No writable Sent mailbox was found")
+
+    return imap.run("save_sent_copy", _run)
 
 
 def get_email_body(msg: email.message.Message) -> tuple[str, str]:
@@ -461,99 +552,242 @@ def handle_get_email(args: dict, imap: ImapManager) -> str:
         return json.dumps({"error": f"Failed to read email: {str(e)}"})
 
 
-def handle_send_email(args: dict, config: dict, input_artifacts: dict[str, dict]) -> str:
-    """Send an email via SMTP."""
+def handle_send_email(
+    args: dict,
+    config: dict,
+    input_artifacts: dict[str, dict],
+    artifact_lock: threading.Lock,
+    imap: ImapManager,
+) -> str:
+    """Submit an email to SMTP without claiming downstream delivery."""
     to_addr = args.get("to")
     subject = args.get("subject")
     body = args.get("body")
     cc = args.get("cc")
-    reply_to_id = args.get("reply_to_email_id")
+    reply_to_id = args.get("reply_to_message_id") or args.get("reply_to_email_id")
     attachments = args.get("attachments") or []
 
-    if not to_addr or not subject or not body:
-        return json.dumps({"error": "to, subject, and body are required"})
-
-    log.info("send_email: to=%s subject=%s", to_addr, subject[:60] if subject else "")
+    if not isinstance(to_addr, str) or not to_addr.strip():
+        raise ToolFailure("invalid_arguments", "A recipient is required.")
+    if not isinstance(subject, str) or not subject.strip():
+        raise ToolFailure("invalid_arguments", "A subject is required.")
+    if not isinstance(body, str) or not body.strip():
+        raise ToolFailure("invalid_arguments", "A message body is required.")
+    if any(char in value for value in (to_addr, subject, cc or "") for char in "\r\n"):
+        raise ToolFailure("invalid_arguments", "Email headers must not contain line breaks.")
+    if reply_to_id and (
+        not isinstance(reply_to_id, str) or not MESSAGE_ID_PATTERN.fullmatch(reply_to_id)
+    ):
+        raise ToolFailure(
+            "invalid_reply_message_id",
+            "The reply reference must be an RFC Message-ID returned by get_email.",
+        )
+    if not isinstance(attachments, list):
+        raise ToolFailure("invalid_arguments", "Attachments must be a list.")
 
     email_addr = config.get("EMAIL_ADDRESS", "")
     password = config.get("APP_PASSWORD", "")
+    if not email_addr or not password:
+        raise ToolFailure(
+            "missing_credentials",
+            "The iCloud email address and app-specific password are required.",
+        )
     smtp_server = config.get("SMTP_SERVER", DEFAULT_SMTP_SERVER)
     smtp_port = int(config.get("SMTP_PORT", str(DEFAULT_SMTP_PORT)))
 
-    try:
-        msg = email.mime.multipart.MIMEMultipart()
-        msg["From"] = email_addr
-        msg["To"] = to_addr
-        msg["Subject"] = subject
-        if cc:
-            msg["Cc"] = cc
-        if reply_to_id:
-            msg["In-Reply-To"] = reply_to_id
-            msg["References"] = reply_to_id
+    recipient_pairs = email.utils.getaddresses([to_addr, cc or ""])
+    recipients = [address.strip() for _, address in recipient_pairs if address.strip()]
+    if not recipients:
+        raise ToolFailure("invalid_arguments", "At least one valid recipient is required.")
 
-        msg.attach(email.mime.text.MIMEText(body, "plain", "utf-8"))
-
-        attached = []
+    prepared_attachments: list[tuple[str, dict, str, str, bytes]] = []
+    with artifact_lock:
         for idx, attachment in enumerate(attachments):
             if not isinstance(attachment, dict):
-                return json.dumps({"error": f"attachments[{idx}] must be an object"})
-
-            capability_artifact_id = attachment.get("capability_artifact_id")
+                raise ToolFailure(
+                    "invalid_attachment",
+                    f"Attachment {idx + 1} must be an object.",
+                )
+            capability_artifact_id = (
+                attachment.get("capability_artifact_id") or attachment.get("artifact_id")
+            )
             if not isinstance(capability_artifact_id, str) or not capability_artifact_id.strip():
-                return json.dumps({
-                    "error": f"attachments[{idx}] is missing capability_artifact_id",
-                })
-            artifact = input_artifacts.pop(capability_artifact_id, None)
+                raise ToolFailure(
+                    "invalid_attachment",
+                    f"Attachment {idx + 1} is missing capability_artifact_id.",
+                )
+            artifact = input_artifacts.get(capability_artifact_id)
             if artifact is None:
-                return json.dumps({
-                    "error": (
-                        f"attachments[{idx}] references unknown capability_artifact_id "
-                        f"'{capability_artifact_id}'"
-                    ),
-                })
+                raise ToolFailure(
+                    "unknown_attachment",
+                    f"Attachment {idx + 1} is no longer available.",
+                )
 
-            filename = attachment.get("filename") or artifact.get("filename") or f"attachment-{idx + 1}.bin"
-            mime_type = attachment.get("mime_type") or artifact.get("mime_type") or "application/octet-stream"
+            filename = (
+                attachment.get("filename")
+                or artifact.get("filename")
+                or f"attachment-{idx + 1}.bin"
+            )
+            mime_type = (
+                attachment.get("mime_type")
+                or artifact.get("mime_type")
+                or "application/octet-stream"
+            )
             payload = artifact.get("data") or b""
-
             if len(payload) > MAX_ATTACHMENT_BYTES:
-                return json.dumps({
-                    "error": (
-                        f"attachments[{idx}] exceeds size limit "
-                        f"({MAX_ATTACHMENT_BYTES} bytes)"
-                    ),
-                })
+                raise ToolFailure(
+                    "attachment_too_large",
+                    f"Attachment {idx + 1} exceeds the {MAX_ATTACHMENT_BYTES}-byte limit.",
+                )
+            prepared_attachments.append(
+                (capability_artifact_id, artifact, filename, mime_type, payload)
+            )
 
-            main_type, _, sub_type = mime_type.partition("/")
-            if main_type != "application" or not sub_type:
-                main_type = "application"
-                sub_type = "octet-stream"
-            part = email.mime.application.MIMEApplication(payload, _subtype=sub_type)
-            part.add_header("Content-Disposition", "attachment", filename=filename)
-            msg.attach(part)
-            attached.append({"filename": filename, "mime_type": mime_type, "size_bytes": len(payload)})
+    msg = email.mime.multipart.MIMEMultipart()
+    msg["From"] = email_addr
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    sent_at = datetime.now(timezone.utc)
+    msg["Date"] = email.utils.format_datetime(sent_at)
+    sender_domain = email_addr.rpartition("@")[2] or None
+    message_id = email.utils.make_msgid(domain=sender_domain)
+    msg["Message-ID"] = message_id
+    if cc:
+        msg["Cc"] = cc
+    if reply_to_id:
+        msg["In-Reply-To"] = reply_to_id
+        msg["References"] = reply_to_id
+    msg.attach(email.mime.text.MIMEText(body, "plain", "utf-8"))
 
-        # Build recipient list
-        recipients = [addr.strip() for addr in to_addr.split(",")]
-        if cc:
-            recipients.extend([addr.strip() for addr in cc.split(",")])
+    attached = []
+    artifact_ids = []
+    for capability_artifact_id, _artifact, filename, mime_type, payload in prepared_attachments:
+        main_type, _, sub_type = mime_type.partition("/")
+        if main_type != "application" or not sub_type:
+            sub_type = "octet-stream"
+        part = email.mime.application.MIMEApplication(payload, _subtype=sub_type)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
+        artifact_ids.append(capability_artifact_id)
+        attached.append(
+            {"filename": filename, "mime_type": mime_type, "size_bytes": len(payload)}
+        )
 
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(email_addr, password)
-            server.send_message(msg, from_addr=email_addr, to_addrs=recipients)
+    def consume_artifacts() -> None:
+        with artifact_lock:
+            for artifact_id in artifact_ids:
+                input_artifacts.pop(artifact_id, None)
 
-        log.info("send_email: sent to %s", to_addr)
-        return json.dumps({
-            "ok": True,
-            "to": to_addr,
-            "subject": subject,
+    log.info(
+        "send_email: submitting recipient_count=%d attachment_count=%d",
+        len(recipients),
+        len(attached),
+    )
+    server = None
+    send_started = False
+    result: Optional[dict] = None
+    try:
+        tls_context = ssl.create_default_context()
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=NETWORK_TIMEOUT_SECONDS)
+        server.ehlo()
+        server.starttls(context=tls_context)
+        server.ehlo()
+        server.login(email_addr, password)
+        send_started = True
+        refused = server.send_message(msg, from_addr=email_addr, to_addrs=recipients) or {}
+
+        refused_lookup = {address.casefold() for address in refused}
+        accepted = [address for address in recipients if address.casefold() not in refused_lookup]
+        refused_recipients = [address for address in recipients if address.casefold() in refused_lookup]
+        if not accepted:
+            raise ToolFailure("recipients_refused", "The SMTP server rejected every recipient.")
+
+        if refused_recipients:
+            result = {
+                "ok": False,
+                "delivery_status": "partial",
+                "message_id": message_id,
+                "accepted_recipients": accepted,
+                "refused_recipients": refused_recipients,
+                "retry_safe": False,
+                "attachments": attached,
+            }
+        else:
+            result = {
+                "ok": True,
+                "delivery_status": "accepted",
+                "message_id": message_id,
+                "accepted_recipients": accepted,
+                "refused_recipients": [],
+                "retry_safe": False,
+                "attachments": attached,
+            }
+    except ToolFailure:
+        raise
+    except smtplib.SMTPRecipientsRefused as exc:
+        log.warning("send_email: all recipients refused count=%d", len(exc.recipients))
+        raise ToolFailure("recipients_refused", "The SMTP server rejected every recipient.") from None
+    except smtplib.SMTPAuthenticationError:
+        raise ToolFailure(
+            "authentication_failed",
+            "iCloud rejected the email address or app-specific password.",
+        ) from None
+    except (smtplib.SMTPSenderRefused, smtplib.SMTPDataError):
+        raise ToolFailure("smtp_rejected", "iCloud rejected the message before accepting it.") from None
+    except (smtplib.SMTPServerDisconnected, TimeoutError, OSError):
+        if not send_started:
+            raise ToolFailure(
+                "smtp_unavailable",
+                "The iCloud mail server could not be reached.",
+            ) from None
+        result = {
+            "ok": False,
+            "delivery_status": "unknown",
+            "message_id": message_id,
+            "accepted_recipients": [],
+            "refused_recipients": [],
+            "retry_safe": False,
             "attachments": attached,
-        })
+        }
+    except (smtplib.SMTPException, ValueError):
+        raise ToolFailure("smtp_failed", "iCloud did not accept the message.") from None
+    finally:
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:
+                try:
+                    server.close()
+                except Exception:
+                    pass
+                log.warning("send_email: SMTP connection closed without a clean QUIT")
 
-    except Exception as e:
-        log.error("send_email failed: %s\n%s", e, traceback.format_exc())
-        return json.dumps({"error": f"Failed to send email: {str(e)}"})
+    if result is None:
+        raise ToolFailure("smtp_failed", "iCloud did not accept the message.")
+
+    result["sent_copy_status"] = "not_attempted"
+    if result["delivery_status"] in {"accepted", "partial"}:
+        try:
+            sent_mailbox = save_sent_copy(
+                imap,
+                msg.as_bytes(policy=email.policy.SMTP),
+                sent_at,
+            )
+            result["sent_copy_status"] = "saved"
+            result["sent_mailbox"] = sent_mailbox
+            log.info("send_email: saved Sent copy mailbox=%s", sent_mailbox)
+        except Exception as exc:
+            result["sent_copy_status"] = "failed"
+            log.warning("send_email: SMTP accepted but Sent copy failed: %s", exc)
+
+    consume_artifacts()
+    log.info(
+        "send_email: completed status=%s accepted=%d refused=%d",
+        result["delivery_status"],
+        len(result["accepted_recipients"]),
+        len(result["refused_recipients"]),
+    )
+    return json.dumps(result)
 
 
 def handle_search_emails(args: dict, imap: ImapManager) -> str:
@@ -906,18 +1140,6 @@ def handle_create_calendar_event(args: dict, config: dict) -> str:
         return json.dumps({"error": f"Failed to create event: {str(e)}"})
 
 
-# ── Tool dispatch ────────────────────────────────────────────────────────────
-
-# Mapping from tool name to primary parameter (for malformed args fallback)
-TOOL_PRIMARY_PARAM: dict[str, str] = {
-    "check_email": "folder",
-    "get_email": "email_id",
-    "search_emails": "query",
-    "check_calendar": "days_ahead",
-    "create_calendar_event": "summary",
-}
-
-
 # ── gRPC Servicer ────────────────────────────────────────────────────────────
 
 
@@ -925,8 +1147,8 @@ class PimCapabilityServicer(capability_pb2_grpc.CapabilityServicer):
     """gRPC server implementing the Selu Capability interface for PIM."""
 
     def __init__(self) -> None:
-        self.imap = ImapManager()
         self._input_artifacts: dict[str, dict] = {}
+        self._artifact_lock = threading.Lock()
 
     def Healthcheck(self, request, context):
         return capability_pb2.HealthResponse(ready=True)
@@ -934,97 +1156,110 @@ class PimCapabilityServicer(capability_pb2_grpc.CapabilityServicer):
     def Invoke(self, request, context):
         tool_name = request.tool_name
         cap_id = request.capability_id or "pim"
-
         log.info("Invoke: tool=%s capability=%s", tool_name, cap_id)
 
-        # Parse arguments
         try:
-            args = json.loads(request.args_json) if request.args_json else {}
-        except json.JSONDecodeError:
-            # Handle bare string args (Bedrock streaming parser edge case)
-            raw = request.args_json.decode("utf-8", errors="replace") if isinstance(request.args_json, bytes) else str(request.args_json)
-            primary = TOOL_PRIMARY_PARAM.get(tool_name)
-            if primary:
-                args = {primary: raw}
-            else:
-                args = {}
-            log.warning("Invoke: malformed JSON args for %s, wrapped as: %s", tool_name, args)
+            try:
+                args = json.loads(request.args_json) if request.args_json else {}
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                raise ToolFailure(
+                    "invalid_arguments",
+                    "The tool arguments are not valid JSON.",
+                ) from None
+            if not isinstance(args, dict):
+                raise ToolFailure(
+                    "invalid_arguments",
+                    "The tool arguments must be a JSON object.",
+                )
 
-        if isinstance(args, str):
-            primary = TOOL_PRIMARY_PARAM.get(tool_name)
-            if primary:
-                args = {primary: args}
-            else:
-                args = {}
+            try:
+                config = json.loads(request.config_json) if request.config_json else {}
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                raise ToolFailure(
+                    "invalid_configuration",
+                    "The capability configuration is not valid JSON.",
+                ) from None
+            if not isinstance(config, dict):
+                raise ToolFailure(
+                    "invalid_configuration",
+                    "The capability configuration must be a JSON object.",
+                )
 
-        log.debug("Invoke: args=%s", json.dumps(args, default=str)[:500])
+            email_addr = config.get("EMAIL_ADDRESS")
+            password = config.get("APP_PASSWORD")
+            if not isinstance(email_addr, str) or not email_addr:
+                raise ToolFailure(
+                    "missing_credentials",
+                    "The iCloud email address is required.",
+                )
+            if not isinstance(password, str) or not password:
+                raise ToolFailure(
+                    "missing_credentials",
+                    "The iCloud app-specific password is required.",
+                )
 
-        # Parse credentials from config_json
-        config: dict[str, str] = {}
-        try:
-            if request.config_json:
-                config = json.loads(request.config_json)
-        except json.JSONDecodeError:
-            log.warning("Invoke: failed to parse config_json")
+            imap: Optional[ImapManager] = None
+            if tool_name in {"check_email", "get_email", "send_email", "search_emails"}:
+                imap = ImapManager()
+                imap_server = config.get("IMAP_SERVER", DEFAULT_IMAP_SERVER)
+                imap_port = int(config.get("IMAP_PORT", str(DEFAULT_IMAP_PORT)))
+                imap.configure(imap_server, imap_port, email_addr, password)
 
-        # Log which config keys are present (not values — those are secrets)
-        log.debug("Invoke: config keys=%s", list(config.keys()))
-
-        # Inject credentials as temporary env vars for consistency,
-        # but also pass config dict directly to handlers that need it.
-        env_backup: dict[str, Optional[str]] = {}
-        for key, value in config.items():
-            env_backup[key] = os.environ.get(key)
-            os.environ[key] = value
-
-        try:
-            # Configure IMAP with credentials
-            email_addr = config.get("EMAIL_ADDRESS", "")
-            password = config.get("APP_PASSWORD", "")
-            imap_server = config.get("IMAP_SERVER", DEFAULT_IMAP_SERVER)
-            imap_port = int(config.get("IMAP_PORT", str(DEFAULT_IMAP_PORT)))
-
-            if email_addr and password:
-                self.imap.configure(imap_server, imap_port, email_addr, password)
-
-            # Dispatch to handler
-            if tool_name == "check_email":
-                result = handle_check_email(args, self.imap)
-            elif tool_name == "get_email":
-                result = handle_get_email(args, self.imap)
-            elif tool_name == "send_email":
-                result = handle_send_email(args, config, self._input_artifacts)
-            elif tool_name == "search_emails":
-                result = handle_search_emails(args, self.imap)
-            elif tool_name == "list_calendars":
-                result = handle_list_calendars(args, config)
-            elif tool_name == "check_calendar":
-                result = handle_check_calendar(args, config)
-            elif tool_name == "create_calendar_event":
-                result = handle_create_calendar_event(args, config)
-            else:
-                log.warning("Invoke: unknown tool %s", tool_name)
-                result = json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-            log.debug("Invoke: result=%s", result[:500] if len(result) > 500 else result)
-
-            return capability_pb2.InvokeResponse(
-                result_json=result.encode("utf-8")
-            )
-
-        except Exception as e:
-            log.error("Invoke: unhandled exception in %s: %s\n%s",
-                      tool_name, e, traceback.format_exc())
-            return capability_pb2.InvokeResponse(
-                error=f"Tool '{tool_name}' failed: {str(e)}"
-            )
-        finally:
-            # Restore environment
-            for key, original in env_backup.items():
-                if original is None:
-                    os.environ.pop(key, None)
+            try:
+                if tool_name == "check_email":
+                    result = handle_check_email(args, imap)
+                elif tool_name == "get_email":
+                    result = handle_get_email(args, imap)
+                elif tool_name == "send_email":
+                    result = handle_send_email(
+                        args,
+                        config,
+                        self._input_artifacts,
+                        self._artifact_lock,
+                        imap,
+                    )
+                elif tool_name == "search_emails":
+                    result = handle_search_emails(args, imap)
+                elif tool_name == "list_calendars":
+                    result = handle_list_calendars(args, config)
+                elif tool_name == "check_calendar":
+                    result = handle_check_calendar(args, config)
+                elif tool_name == "create_calendar_event":
+                    result = handle_create_calendar_event(args, config)
                 else:
-                    os.environ[key] = original
+                    raise ToolFailure("unknown_tool", "The requested tool is not available.")
+            finally:
+                if imap is not None:
+                    imap.close()
+
+            if not isinstance(result, str):
+                raise ToolFailure(
+                    "invalid_result",
+                    "The capability returned an invalid result.",
+                )
+            try:
+                result_value = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                raise ToolFailure(
+                    "invalid_result",
+                    "The capability returned invalid JSON.",
+                ) from None
+            if isinstance(result_value, dict) and result_value.get("error"):
+                log.warning("Invoke: tool=%s returned a legacy error payload", tool_name)
+                raise ToolFailure(
+                    f"{tool_name}_failed",
+                    "The requested operation could not be completed.",
+                )
+
+            return capability_pb2.InvokeResponse(result_json=result.encode("utf-8"))
+        except ToolFailure as exc:
+            log.warning("Invoke: tool=%s failed code=%s", tool_name, exc.code)
+            return capability_pb2.InvokeResponse(error=exc.response_message())
+        except Exception:
+            log.exception("Invoke: unexpected failure tool=%s", tool_name)
+            return capability_pb2.InvokeResponse(
+                error=f"{tool_name}_failed: The requested operation could not be completed."
+            )
 
     def StreamInvoke(self, request, context):
         """Wrap Invoke as a single-chunk stream (PIM tools are synchronous)."""
@@ -1054,11 +1289,12 @@ class PimCapabilityServicer(capability_pb2_grpc.CapabilityServicer):
                     )
 
         capability_artifact_id = str(uuid4())
-        self._input_artifacts[capability_artifact_id] = {
-            "filename": filename or "attachment.bin",
-            "mime_type": mime_type or "application/octet-stream",
-            "data": bytes(data),
-        }
+        with self._artifact_lock:
+            self._input_artifacts[capability_artifact_id] = {
+                "filename": filename or "attachment.bin",
+                "mime_type": mime_type or "application/octet-stream",
+                "data": bytes(data),
+            }
         return capability_pb2.UploadInputArtifactResponse(
             capability_artifact_id=capability_artifact_id,
             size_bytes=len(data),
@@ -1090,7 +1326,6 @@ def serve() -> None:
         print(f"Received signal {signum}, shutting down...", flush=True)
         stop_event.set()
         server.stop(grace=5)
-        servicer.imap.close()
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
